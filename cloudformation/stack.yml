@@ -1,0 +1,375 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  AWS Cloud Monitoring & Auto-Scaling Demo with DynamoDB for visit counts.
+  Creates: IAM Role for EC2, Security Group, LaunchTemplate, AutoScalingGroup (min1 max2),
+  Application Load Balancer, Target Group, CloudWatch Alarms, SNS Topic, DynamoDB table.
+
+Parameters:
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: Name of existing EC2 KeyPair for SSH access
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    AllowedValues: [t2.micro, t3.micro, t3a.micro]
+    Description: EC2 instance type (use free-tier eligible if available)
+  SSHLocation:
+    Type: String
+    Default: 0.0.0.0/0
+    Description: Source IP range for SSH (set to your IP/32 for safety)
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC to deploy into
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: At least two public subnets in the chosen VPC, comma-separated
+
+Resources:
+
+  # === IAM role for EC2 instances with policies ===
+  InstanceProfileRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: DynamoDBAccessForApp
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource: !Sub arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/VisitsTable
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: /
+      Roles:
+        - !Ref InstanceProfileRole
+
+  # === DynamoDB table to store visit counts ===
+  VisitsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: VisitsTable
+      AttributeDefinitions:
+        - AttributeName: path
+          AttributeType: S
+      KeySchema:
+        - AttributeName: path
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+
+  # === Security group ===
+  WebSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for web app
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref SSHLocation
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          FromPort: 0
+          ToPort: 0
+          CidrIp: 0.0.0.0/0
+
+  # === Launch Template with UserData to bootstrap app & CloudWatch agent ===
+  WebLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        InstanceType: !Ref InstanceType
+        IamInstanceProfile:
+          Name: !Ref InstanceProfile
+        SecurityGroupIds:
+          - !GetAtt WebSecurityGroup.GroupId
+        KeyName: !Ref KeyName
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash -xe
+            # Update and install basics
+            if command -v yum >/dev/null 2>&1; then
+              yum update -y
+              yum install -y git openssl
+            else
+              apt-get update -y
+              apt-get install -y git openssl
+            fi
+
+            # Install Node (18)
+            if command -v yum >/dev/null 2>&1; then
+              curl -fsSL https://rpm.nodesource.com/setup_18.x | bash -
+              yum install -y nodejs
+            else
+              curl -fsSL https://deb.nodesource.com/setup_18.x | bash -
+              apt-get install -y nodejs
+            fi
+
+            # Create app dir and files (same as deployment)
+            mkdir -p /home/ec2-user/aws-monitor-app
+            cd /home/ec2-user/aws-monitor-app
+
+            # Write server.js
+            cat > server.js <<'EOF'
+            const http = require('http');
+            const os = require('os');
+            const AWS = require('aws-sdk');
+            const dynamodb = new AWS.DynamoDB({region: process.env.AWS_REGION || 'us-east-1'});
+            const TABLE = process.env.VISITS_TABLE || 'VisitsTable';
+            const port = process.env.PORT || 80;
+
+            async function incrementVisit(path){
+              const params = {
+                TableName: TABLE,
+                Key: { path: { S: path } },
+                UpdateExpression: 'ADD visit_count :inc',
+                ExpressionAttributeValues: { ':inc': { N: '1' } },
+                ReturnValues: 'UPDATED_NEW'
+              };
+              return dynamodb.updateItem(params).promise();
+            }
+
+            async function getVisitCount(path){
+              const params = { TableName: TABLE, Key: { path: { S: path } } };
+              const res = await dynamodb.getItem(params).promise();
+              if(!res.Item || !res.Item.visit_count) return 0;
+              return Number(res.Item.visit_count.N);
+            }
+
+            const server = http.createServer(async (req,res)=>{
+              if(req.url === '/health'){
+                res.writeHead(200,{'Content-Type':'text/plain'});
+                res.end('OK\n');
+                return;
+              }
+              try{
+                await incrementVisit(req.url);
+                const count = await getVisitCount(req.url);
+                const data = {
+                  hostname: os.hostname(),
+                  uptime_seconds: Math.floor(os.uptime()),
+                  loadavg: os.loadavg(),
+                  path: req.url,
+                  visits: count,
+                  timestamp: new Date().toISOString()
+                };
+                res.writeHead(200,{'Content-Type':'application/json'});
+                res.end(JSON.stringify(data));
+              }catch(e){
+                res.writeHead(500,{'Content-Type':'application/json'});
+                res.end(JSON.stringify({ error: e.message }));
+              }
+            });
+
+            server.listen(port, ()=> console.log('listening', port));
+            EOF
+
+            # package.json
+            cat > package.json <<'EOF'
+            {
+              "name":"aws-monitor-app",
+              "version":"1.0.0",
+              "main":"server.js",
+              "scripts":{"start":"node server.js"},
+              "dependencies":{"aws-sdk":"^2.1350.0"}
+            }
+            EOF
+
+            npm install --production || true
+
+            # systemd service
+            cat > /etc/systemd/system/aws-monitor-app.service <<'SYSTEMD'
+            [Unit]
+            Description=AWS Monitor App
+            After=network.target
+
+            [Service]
+            ExecStart=/usr/bin/node /home/ec2-user/aws-monitor-app/server.js
+            Restart=always
+            User=root
+            Environment=PORT=80
+            Environment=VISITS_TABLE=VisitsTable
+
+            [Install]
+            WantedBy=multi-user.target
+            SYSTEMD
+
+            systemctl daemon-reload || true
+            systemctl enable aws-monitor-app || true
+            systemctl start aws-monitor-app || true
+
+            # Install CloudWatch agent
+            if command -v yum >/dev/null 2>&1; then
+              yum install -y amazon-cloudwatch-agent || true
+            else
+              apt-get install -y amazon-cloudwatch-agent || true
+            fi
+
+            cat > /opt/aws/amazon-cloudwatch-agent/bin/config.json <<'CWCFG'
+            {
+              "agent": {"metrics_collection_interval": 60, "run_as_user": "root"},
+              "metrics": {
+                "append_dimensions": { "InstanceId": "${!aws:InstanceId}" },
+                "metrics_collected": {
+                  "cpu": { "measurement": ["cpu_usage_idle","cpu_usage_iowait"], "metrics_collection_interval": 60 },
+                  "mem": { "measurement": ["mem_used_percent"], "metrics_collection_interval": 60 }
+                }
+              }
+            }
+            CWCFG
+
+            /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a stop || true
+            /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 -c file:/opt/aws/amazon-cloudwatch-agent/bin/config.json -s || true
+
+  # === ALB Target Group ===
+  WebTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Port: 80
+      Protocol: HTTP
+      VpcId: !Ref VpcId
+      TargetType: instance
+      HealthCheckProtocol: HTTP
+      HealthCheckPath: /health
+      Matcher:
+        HttpCode: 200
+
+  # === Application Load Balancer ===
+  WebALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Subnets: !Ref SubnetIds
+      SecurityGroups:
+        - !GetAtt WebSecurityGroup.GroupId
+      Scheme: internet-facing
+
+  ALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref WebALB
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref WebTargetGroup
+
+  # === Auto Scaling Group ===
+  WebASG:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref WebLaunchTemplate
+        Version: !GetAtt WebLaunchTemplate.LatestVersionNumber
+      MinSize: '1'
+      MaxSize: '2'
+      TargetGroupARNs:
+        - !Ref WebTargetGroup
+      VPCZoneIdentifier: !Ref SubnetIds
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 120
+
+  # === CloudWatch Alarms and Scaling Policies ===
+  ScalingPolicyUp:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref WebASG
+      PolicyType: SimpleScaling
+      AdjustmentType: ChangeInCapacity
+      ScalingAdjustment: 1
+      Cooldown: 300
+
+  ScalingPolicyDown:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref WebASG
+      PolicyType: SimpleScaling
+      AdjustmentType: ChangeInCapacity
+      ScalingAdjustment: -1
+      Cooldown: 300
+
+  HighCPUAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: "Alarm if average CPU > 60% for 2 periods"
+      Namespace: AWS/EC2
+      MetricName: CPUUtilization
+      Dimensions:
+        - Name: AutoScalingGroupName
+          Value: !Ref WebASG
+      Statistic: Average
+      Period: 60
+      EvaluationPeriods: 2
+      Threshold: 60
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref ScalingPolicyUp
+        - !Ref NotifyTopic
+
+  LowCPUAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: "Alarm if average CPU < 20% for 3 periods"
+      Namespace: AWS/EC2
+      MetricName: CPUUtilization
+      Dimensions:
+        - Name: AutoScalingGroupName
+          Value: !Ref WebASG
+      Statistic: Average
+      Period: 60
+      EvaluationPeriods: 3
+      Threshold: 20
+      ComparisonOperator: LessThanThreshold
+      AlarmActions:
+        - !Ref ScalingPolicyDown
+        - !Ref NotifyTopic
+
+  # === SNS for notifications ===
+  NotifyTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: AWS-Monitoring-Alerts
+
+  NotifyTopicSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref NotifyTopic
+      Protocol: email
+      Endpoint: you@example.com   # change after deployment or update via console
+
+Outputs:
+  LoadBalancerDNS:
+    Description: DNS name of the ALB
+    Value: !GetAtt WebALB.DNSName
+    Export:
+      Name: WebALB-DNS
+  SNS:
+    Description: SNS Topic ARN
+    Value: !Ref NotifyTopic
+  VisitsTableName:
+    Description: DynamoDB table name
+    Value: !Ref VisitsTable
