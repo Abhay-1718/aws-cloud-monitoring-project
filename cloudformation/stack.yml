@@ -359,7 +359,7 @@ Resources:
     Properties:
       TopicArn: !Ref NotifyTopic
       Protocol: email
-      Endpoint: you@example.com   # change after deployment or update via console
+      Endpoint: abhaysingh80766@gmail.com   # change after deployment or update via console
 
 Outputs:
   LoadBalancerDNS:
